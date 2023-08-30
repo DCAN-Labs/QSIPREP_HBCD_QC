@@ -17,7 +17,7 @@ from scipy import ndimage
 from scipy.special import expit
 
 def parse_args():
-    parser = argparse.ArgumentParser("make-gifs")
+    parser = argparse.ArgumentParser()
     parser.add_argument("bids_dir", help="The path to the BIDS directory for your study (this is the same for all subjects)", type=str)
     parser.add_argument("output_dir", help="The path to the folder where outputs will be stored (this is the same for all subjects)", type=str)
     parser.add_argument("analysis_level", help="Should always be participant", type=str)
