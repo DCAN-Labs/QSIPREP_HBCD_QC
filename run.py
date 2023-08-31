@@ -16,9 +16,10 @@ from dipy.core.gradients import gradient_table
 from scipy import ndimage
 from scipy.special import expit
 
+
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("bids_dir", help="The path to the BIDS directory for your study (this is the same for all subjects)", type=str)
+    parser.add_argument("qsiprep_dir", help="The path to the BIDS directory for your study (this is the same for all subjects)", type=str)
     parser.add_argument("output_dir", help="The path to the folder where outputs will be stored (this is the same for all subjects)", type=str)
     parser.add_argument("analysis_level", help="Should always be participant", type=str)
     
@@ -57,39 +58,57 @@ def create_gifs(bids_dir, subject, output_dir, session = None):
     fname_rgb = f"sub-{subject}_tensor_rgb.nii.gz"
     
     # Use pybids to grab the necessary image files
-    bids_filters = {"subject": subject, "return_type": "filename"}
+    initial_bids_filters = {"subject": subject, "return_type": "filename"}
     if type(session) != type(None):
-        bids_filters["session"] = session
-    
-    fb0 = layout.get(suffix="dwiref", extension="nii.gz", **bids_filters)[0]
-    fdwi = layout.get(suffix="dwi", extension="nii.gz", **bids_filters)[0]
-    fmask = layout.get(suffix="mask", datatype="dwi", extension="nii.gz", **bids_filters)[0]
-    
-    # Load the niftis
-    b0_data, b0_affine = load_nifti(fb0)
-    t1w_data, t1w_affine = load_nifti(fb0)
-    mask_data, mask_affine = load_nifti(fmask)
-    data, affine = load_nifti(fdwi)
-    
-    # Load the gradient table
-    fbval = layout.get_bval(path=fdwi, subject=subject)
-    fbvec = layout.get_bvec(path=fdwi, subject=subject)
-    bvals, bvecs = read_bvals_bvecs(fbval, fbvec)
-    gtab = gradient_table(bvals, bvecs)
+        initial_bids_filters["session"] = session
+    fb0s = layout.get(suffix="dwiref", extension="nii.gz", **initial_bids_filters)
+    for i, temp_fb0 in enumerate(fb0s):
 
-    # Fit a tensor model and compute FA
-    tenmodel = dti.TensorModel(gtab)
-    tenfit = tenmodel.fit(data)
-    FA = dti.fractional_anisotropy(tenfit.evals)
-    FA = np.clip(FA, 0, 1)
+        temp_fb0_split = temp_fb0.split('/')[-1].split('_')[:-1]
+        temp_entities = {}
+        for temp_split in temp_fb0_split:
+            temp_split_split = temp_split.split('-')
+            temp_entities[temp_split_split[0]] = temp_split_split[1]
+        if 'run' in temp_entities.keys():
+            run_specific_bids_filters = initial_bids_filters.copy()
+            run_specific_bids_filters['run'] = temp_entities['run']
+            fname_gif = f"sub-{subject}_run-{temp_entities['run']}_desc-b0colorfa_slice-"
+            fname_fa = f"sub-{subject}_run-{temp_entities['run']}_tensor_fa.nii.gz"
+            fname_rgb = f"sub-{subject}_run-{temp_entities['run']}_tensor_rgb.nii.gz"
+        else:
+            fname_gif = f"sub-{subject}_desc-b0colorfa_slice-"
+            fname_fa = f"sub-{subject}_tensor_fa.nii.gz"
+            fname_rgb = f"sub-{subject}_tensor_rgb.nii.gz"
+    
+        fb0 = layout.get(suffix="dwiref", extension="nii.gz", **run_specific_bids_filters)[0]
+        fdwi= layout.get(suffix="dwi", extension="nii.gz", **run_specific_bids_filters)[0]
+        fmask = layout.get(suffix="mask", datatype="dwi", extension="nii.gz", **run_specific_bids_filters)[0]
+    
+        # Load the niftis
+        b0_data, b0_affine = load_nifti(fb0)
+        t1w_data, t1w_affine = load_nifti(fb0)
+        mask_data, mask_affine = load_nifti(fmask)
+        data, affine = load_nifti(fdwi)
+        
+        # Load the gradient table
+        fbval = layout.get_bval(path=fdwi, subject=subject)
+        fbvec = layout.get_bvec(path=fdwi, subject=subject)
+        bvals, bvecs = read_bvals_bvecs(fbval, fbvec)
+        gtab = gradient_table(bvals, bvecs)
 
-    # Convert to colorFA image as in DIPY documentation
-    FA_masked = FA * mask_data
-    RGB = dti.color_fa(FA_masked, tenfit.evecs)
+        # Fit a tensor model and compute FA
+        tenmodel = dti.TensorModel(gtab)
+        tenfit = tenmodel.fit(data)
+        FA = dti.fractional_anisotropy(tenfit.evals)
+        FA = np.clip(FA, 0, 1)
 
-    RGB = np.array(255 * RGB, 'uint8')
-    save_nifti(fname_fa, FA_masked.astype(np.float32), affine)
-    save_nifti(fname_rgb, RGB, affine)    
+        # Convert to colorFA image as in DIPY documentation
+        FA_masked = FA * mask_data
+        RGB = dti.color_fa(FA_masked, tenfit.evecs)
+
+        RGB = np.array(255 * RGB, 'uint8')
+        save_nifti(fname_fa, FA_masked.astype(np.float32), affine)
+        save_nifti(fname_rgb, RGB, affine) 
     
     def trim_zeros(arr, margin=0, trim_dims=None):
         '''
@@ -161,11 +180,11 @@ def create_gifs(bids_dir, subject, output_dir, session = None):
     b0_data = pad_square_2d(b0_data)
 
     # Create the local output dir
-    if type(session) == type(None):
+    if type(session) != type(None):
         session_name = session
     else:
         session_name = ''
-    png_dir = os.path.join(output_dir, subject, session_name, 'dwi')
+    png_dir = os.path.join(output_dir, 'sub-' + subject, 'ses-' + session_name, 'dwi')
     os.makedirs(png_dir, exist_ok=True)
     
     # Enlarge images
@@ -216,45 +235,54 @@ def create_gifs(bids_dir, subject, output_dir, session = None):
         # Save the gif
         imageio.mimsave(file_path, images, loop=0, fps=fps, subrectangles=True)
             
-def main():
 
-    #Grab the arg parse inputs 
-    args = parse_args()
+#Grab the arg parse inputs 
+args = parse_args()
+cwd = os.getcwd()
 
-    #reassign variables to command line input
-    bids_dir = args.bids_dir
-    if os.path.isabs(bids_dir) == False:
-        bids_dir = os.path.join(cwd, bids_dir)
-    output_dir = args.output_dir
-    if os.path.isabs(output_dir) == False:
-        output_dir = os.path.join(cwd, output_dir)
-    analysis_level = args.analysis_level
-    if analysis_level != 'participant':
-        raise ValueError('Error: analysis level must be participant, but program received: ' + analysis_level)
+#reassign variables to command line input
+qsiprep_dir = args.qsiprep_dir
+if os.path.isabs(qsiprep_dir) == False:
+    qsiprep_dir = os.path.join(cwd, qsiprep_dir)
+output_dir = args.output_dir
+if os.path.isabs(output_dir) == False:
+    output_dir = os.path.join(cwd, output_dir)
+analysis_level = args.analysis_level
+if analysis_level != 'participant':
+    raise ValueError('Error: analysis level must be participant, but program received: ' + analysis_level)
 
-    if args.participant_label:
+if args.participant_label:
+    pass
+else:
+    os.chdir(qsiprep_dir)
+    participants = glob.glob('sub-*')
+
+for temp_participant in participants:
+
+    #Find sessions... if session was provided then
+    #process that specific session. Otherwise iterate
+    #through all sessions or continue without assumption
+    #of sessions if no sessions are found in the BIDS
+    #structure
+
+    #This is mainly to weed out html reports...
+    dwi_path_sessions = os.path.join(qsiprep_dir, temp_participant, 'ses*', 'dwi')
+    dwi_path_no_sessions = os.path.join(qsiprep_dir, temp_participant, 'ses*')
+    if len(glob.glob(dwi_path_sessions)) + len(glob.glob(dwi_path_no_sessions)) == 0:
+        continue
+
+
+    if args.session_id:
         pass
     else:
-        os.chdir(bids_dir)
-        participants = glob.glob('sub-*')
+        os.chdir(os.path.join(qsiprep_dir, temp_participant))
+        sessions = glob.glob('ses-*')
+        if len(sessions) == 0:
+            sessions = None
 
-    for temp_participant in participants:
+    for temp_session in sessions:
 
-        #Find sessions... if session was provided then
-        #process that specific session. Otherwise iterate
-        #through all sessions or continue without assumption
-        #of sessions if no sessions are found in the BIDS
-        #structure
-        if args.session_id:
-            pass
-        else:
-            os.chdir(os.path.join(bids_dir, temp_participant))
-            sessions = glob.glob('ses-*')
-            if len(sessions) == 0:
-                sessions = None
+        if type(temp_session) != type(None):
+            temp_session = temp_session.split('-')[1]
 
-        for temp_session in sessions:
-            create_gifs(args.bids_dir, temp_participant, temp_session)
-
-if __name__ == "__main__":
-    main()
+        create_gifs(qsiprep_dir, temp_participant.split('-')[-1], output_dir, session = temp_session)
