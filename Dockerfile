@@ -6,8 +6,8 @@ RUN python3 -m pip install nibabel==3.2.2
 RUN python3 -m pip install dipy==1.6.0
 RUN python3 -m pip install matplotlib==3.3.4
 RUN python3 -m pip install scipy==1.8.0
-RUN python3 -m pip install pybids=0.16.3
-RUN python3 -m pip install imageio=2.31.2
+RUN python3 -m pip install pybids==0.16.3
+RUN python3 -m pip install imageio==2.31.2
 
 
 #Make code and data directory
