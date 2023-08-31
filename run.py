@@ -1,3 +1,5 @@
+#!/usr/local/bin/python3
+
 ## https://github.com/richford/fibr/blob/master/notebooks/2020-11-16-cloudknot-create-color-fa-gifs.ipynb
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
