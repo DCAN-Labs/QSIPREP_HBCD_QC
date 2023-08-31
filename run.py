@@ -235,7 +235,7 @@ def create_gifs(bids_dir, subject, output_dir, session = None):
         )
         
         # Save the gif
-        imageio.mimsave(file_path, images, loop=0, fps=fps, subrectangles=True)
+        imageio.mimsave(file_path, images, loop=0, duration=(1/fps)*1000, subrectangles=True)
             
 
 #Grab the arg parse inputs 
