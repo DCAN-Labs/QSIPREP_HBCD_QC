@@ -27,6 +27,7 @@ def parse_args():
     
     parser.add_argument('--participant_label', '--participant-label', help="The name/label of the subject to be processed (i.e. sub-01 or 01)", type=str)
     parser.add_argument('--session_id', '--session-id', help="OPTIONAL: the name of a specific session to be processed (i.e. ses-01)", type=str)    
+    parser.add_argument('--bids_directory', '--bids_directory', help="OPTIONAL: This is not actually used for processing.", type=str)  
 
     return parser.parse_args()
 
