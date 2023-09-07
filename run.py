@@ -69,19 +69,28 @@ def create_gifs(bids_dir, subject, output_dir, session = None):
 
         temp_fb0_split = temp_fb0.split('/')[-1].split('_')[:-1]
         temp_entities = {}
+        fname_gif = f"sub-{subject}"
+        fname_fa = f"sub-{subject}"
+        fname_rgb = f"sub-{subject}"
         for temp_split in temp_fb0_split:
             temp_split_split = temp_split.split('-')
             temp_entities[temp_split_split[0]] = temp_split_split[1]
+        if 'ses' in temp_entities.keys():
+            fname_gif = f"{fname_gif}_ses-{temp_entities['ses']}"
+            fname_fa = f"{fname_fa}_ses-{temp_entities['ses']}"
+            fname_rgb = f"{fname_rgb}_ses-{temp_entities['ses']}"
         if 'run' in temp_entities.keys():
             run_specific_bids_filters = initial_bids_filters.copy()
             run_specific_bids_filters['run'] = temp_entities['run']
-            fname_gif = f"sub-{subject}_run-{temp_entities['run']}_desc-b0colorfa_slice-"
-            fname_fa = f"sub-{subject}_run-{temp_entities['run']}_tensor_fa.nii.gz"
-            fname_rgb = f"sub-{subject}_run-{temp_entities['run']}_tensor_rgb.nii.gz"
+            fname_gif = f"{fname_gif}_ses-{temp_entities['run']}"
+            fname_fa = f"{fname_fa}_ses-{temp_entities['run']}"
+            fname_rgb = f"{fname_rgb}_ses-{temp_entities['run']}"
         else:
-            fname_gif = f"sub-{subject}_desc-b0colorfa_slice-"
-            fname_fa = f"sub-{subject}_tensor_fa.nii.gz"
-            fname_rgb = f"sub-{subject}_tensor_rgb.nii.gz"
+            run_specific_bids_filters = initial_bids_filters.copy()
+
+        fname_gif = f"{fname_gif}_desc-b0colorfa_slice-"
+        fname_fa = f"{fname_fa}_tensor_fa.nii.gz"
+        fname_rgb = f"{fname_rgb}_tensor_rgb.nii.gz"
     
         fb0 = layout.get(suffix="dwiref", extension="nii.gz", **run_specific_bids_filters)[0]
         fdwi= layout.get(suffix="dwi", extension="nii.gz", **run_specific_bids_filters)[0]
