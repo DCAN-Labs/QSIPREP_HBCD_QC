@@ -82,9 +82,9 @@ def create_gifs(bids_dir, subject, output_dir, session = None):
         if 'run' in temp_entities.keys():
             run_specific_bids_filters = initial_bids_filters.copy()
             run_specific_bids_filters['run'] = temp_entities['run']
-            fname_gif = f"{fname_gif}_ses-{temp_entities['run']}"
-            fname_fa = f"{fname_fa}_ses-{temp_entities['run']}"
-            fname_rgb = f"{fname_rgb}_ses-{temp_entities['run']}"
+            fname_gif = f"{fname_gif}_run-{temp_entities['run']}"
+            fname_fa = f"{fname_fa}_run-{temp_entities['run']}"
+            fname_rgb = f"{fname_rgb}_run-{temp_entities['run']}"
         else:
             run_specific_bids_filters = initial_bids_filters.copy()
 
