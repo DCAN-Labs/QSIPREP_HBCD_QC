@@ -14,6 +14,12 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from scipy import ndimage
 from scipy.special import expit
+from scipy.stats import scoreatpercentile
+from dipy.io.image import load_nifti, save_nifti
+from dipy.io import read_bvals_bvecs
+from dipy.core.gradients import gradient_table
+import dipy.reconst.dti as dti
+
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
 warnings.simplefilter(action="ignore", category=DeprecationWarning)
@@ -54,9 +60,12 @@ fps = len(slice_gif_offsets) / 2.0
 # figsize_multiplier = 1.5
 my_figsize = (7.2, 7.2)
 
-FA_ALPHA_RANGE = 7  # Plus/minus range for epit
-FA_ALPHA_OFFSET = 0.2  # minimum alpha value
+FA_ALPHA_RANGE = 5  # Plus/minus range for epit
+FA_ALPHA_OFFSET = 0.15  # Added to FA
 FA_ALPHA_MULT = 4  # Steepness of expit
+BRIGHTNESS_UPSCALE = 1.5
+
+PNGRES_SIZE = 90
 
 
 def parse_args():
@@ -95,7 +104,124 @@ def parse_args():
     return parser.parse_args()
 
 
-def create_png_space(hires_maskfile, hires_anatfile):
+def create_dwires_png_space(dwi_file, hires_maskfile, hires_anatfile):
+    """Create an output space with dwi voxel size that is ideal for
+    creating square png images.
+
+    Parameters
+    ----------
+
+    dwi_file: str
+        Path to qsiprep-preprocessed dwi file
+
+    hires_maskfile: str
+        Path to the brain mask from qsiprep
+
+    hires_maskfile: str
+        Path to the brain mask from qsiprep
+
+
+
+    Returns
+    -------
+
+    pngres_maskfile: str
+        Path to the brain mask in png space
+
+    pngres_anatfile: str
+        Path to the anatomical image in png space
+
+    """
+
+    # Create a cube bounding box that we will use to take pics
+    pngres_dwi = op.abspath("pngres_dwi.nii")
+    pngres_anat = op.abspath("pngres_anat.nii")
+    pngres_dec = op.abspath("pngres_dec.nii")
+    pngres_fa = op.abspath("pngres_fa.nii")
+    pngres_mask = op.abspath("pngres_mask.nii")
+    fstem = dwi_file.replace(".nii.gz", "")
+
+    # Zeropad the DWI so it's a cube
+    subprocess.run(
+        [
+            "3dZeropad",
+            "-RL",
+            f"{PNGRES_SIZE}",
+            "-AP",
+            f"{PNGRES_SIZE}",
+            "-IS",
+            f"{PNGRES_SIZE}",
+            "-prefix",
+            pngres_dwi,
+            dwi_file,
+        ],
+        check=True,
+    )
+
+    # Get the brainmask in pngref space
+    subprocess.run(
+        [
+            "antsApplyTransforms",
+            "-d",
+            "3",
+            "-i",
+            hires_maskfile,
+            "-r",
+            pngres_dwi,
+            "-o",
+            pngres_mask,
+            "-v",
+            "1",
+            "--interpolation",
+            "NearestNeighbor",
+        ],
+        check=True,
+    )
+
+    # Resample the anat file into pngres
+    subprocess.run(
+        [
+            "antsApplyTransforms",
+            "-d",
+            "3",
+            "-i",
+            hires_anatfile,
+            "-r",
+            pngres_dwi,
+            "-o",
+            pngres_anat,
+            "-v",
+            "1",
+            "--interpolation",
+            "NearestNeighbor",
+        ],
+        check=True,
+    )
+
+    # Use DIPY to fit a tensor
+    data, affine = load_nifti(pngres_dwi)
+    mask_data, _ = load_nifti(pngres_mask)
+    bvals, bvecs = read_bvals_bvecs(f"{fstem}.bval", f"{fstem}.bvec")
+    gtab = gradient_table(bvals, bvecs)
+    tenmodel = dti.TensorModel(gtab)
+    print(f"Fitting Tensor to {dwi_file}")
+    tenfit = tenmodel.fit(data, mask=mask_data > 0)
+
+    # Get FA and DEC from the tensor fit
+    FA = dti.fractional_anisotropy(tenfit.evals)
+    FA = np.clip(FA, 0, 1)
+
+    # Convert to colorFA image as in DIPY documentation
+    FA_masked = FA * mask_data
+    RGB = dti.color_fa(FA_masked, tenfit.evecs)
+    RGB = np.array(255 * RGB, 'uint8')
+    save_nifti(pngres_fa, FA_masked.astype(np.float32), affine)
+    save_nifti(pngres_dec, RGB, affine)
+
+    return pngres_dec, pngres_fa, pngres_anat, pngres_mask
+
+
+def create_hires_png_space(hires_maskfile, hires_anatfile):
     """Create an output space that is ideal for creating square png images.
 
     Parameters
@@ -311,7 +437,7 @@ def dec_in_pngspace(pngres_mask, zipped_preproc_dwi_file):
     return pngres_dec, pngres_fa_mask
 
 
-def get_anchor_slices_from_mask(mask_file, axis=2):
+def get_anchor_slices_from_mask(mask_file, axis):
     """Find the slice numbers for ``slice_ratios`` inside a mask."""
     mask_arr = nb.load(mask_file).get_fdata()
     mask_coords = np.argwhere(mask_arr > 0)[:, axis]
@@ -454,7 +580,6 @@ def create_gifs(bids_dir, subject, output_dir, session=None):
     if not anat_hires_file:
         raise Exception(f"No high-res T2w image found for f{subject}")
     anat_hires_file = anat_hires_file[0]
-    pngres_brain_mask, pngres_anat = create_png_space(anat_mask_file, anat_hires_file)
 
     # Create the local output dir
     if session is not None:
@@ -475,13 +600,17 @@ def create_gifs(bids_dir, subject, output_dir, session=None):
     # Find all the dwi files, and their corresponding dwi files
     dwi_files = layout.get(suffix="dwi", extension="nii.gz", **initial_bids_filters)
     for dwi_file in dwi_files:
-        pngres_dwi, pngres_fa_mask = dec_in_pngspace(pngres_brain_mask, dwi_file)
+        pngres_dec, pngres_fa, pngres_anat, pngres_brain_mask = create_dwires_png_space(
+            dwi_file,
+            anat_mask_file,
+            anat_hires_file)
+
         gif_prefix = op.join(
             png_dir, f"sub-{subject}_{session_name}_qcgif-".replace("__", "_")
         )
         print(f"Creating GIFs for {dwi_file}")
         # gifs_from_dec(pngres_dwi, pngres_fa_mask, pngres_anat, prefix=gif_prefix)
-        richie_fa_gifs(pngres_dwi, pngres_fa_mask, pngres_anat, pngres_brain_mask, gif_prefix)
+        richie_fa_gifs(pngres_dec, pngres_fa, pngres_anat, pngres_brain_mask, gif_prefix)
         print("Done")
 
 
@@ -522,6 +651,7 @@ def richie_fa_gifs(dec_file, fa_file, anat_file, mask_file, prefix):
     # pngres space. This also converts it to a 3-vector data type.
     rgb_img = nb.load(dec_file)
     rgb_data = rgb_img.get_fdata().squeeze()
+    rgb_data = np.clip(0, 255, rgb_data * BRIGHTNESS_UPSCALE)
 
     # Open FA image and turn it into alpha values
     fa_img = nb.load(fa_file)
@@ -529,6 +659,9 @@ def richie_fa_gifs(dec_file, fa_file, anat_file, mask_file, prefix):
 
     anat_img = nb.load(anat_file)
     anat_data = anat_img.get_fdata()
+    anat_vmin, anat_vmax = scoreatpercentile(anat_data.flatten(), [1, 98])
+
+    print(f"Setting grayscale vmax to {anat_vmax}")
 
     def get_anat_rgba_slices(idx, axis):
         # Select slice from axis and handle rotation
@@ -565,7 +698,12 @@ def richie_fa_gifs(dec_file, fa_file, anat_file, mask_file, prefix):
                 fig, ax = plt.subplots(1, 1, figsize=my_figsize)
                 slice_anat, slice_rgba = get_anat_rgba_slices(slice_idx, axis)
 
-                _ = ax.imshow(slice_anat, cmap=plt.cm.Greys_r)
+                _ = ax.imshow(
+                    slice_anat,
+                    vmin=anat_vmin,
+                    vmax=anat_vmax,
+                    cmap=plt.cm.Greys_r,
+                )
                 _ = ax.imshow(slice_rgba.astype(np.uint8))
                 _ = ax.axis("off")
 
@@ -573,6 +711,10 @@ def richie_fa_gifs(dec_file, fa_file, anat_file, mask_file, prefix):
                 plt.close(fig)
                 images.append(load_and_rotate_png(slice_png_path, axis))
                 temp_image_files.append(slice_png_path)
+
+            # Create a back and forth animation by appending the images to
+            # themselves, but reversed
+            images = images + images[-2:0:-1]
 
             # Save the gif
             imageio.mimsave(
@@ -582,6 +724,8 @@ def richie_fa_gifs(dec_file, fa_file, anat_file, mask_file, prefix):
                 duration=(1 / fps) * 1000,
                 subrectangles=True,
             )
+
+    # Clean up the
     for temp_image in temp_image_files:
         os.remove(temp_image)
 
