@@ -16,7 +16,7 @@ from scipy import ndimage
 from scipy.special import expit
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
-
+warnings.simplefilter(action="ignore", category=DeprecationWarning)
 # Settings for the gifs
 # Specify the slices that we would like to save as a fraction
 # of the masked extent.
@@ -45,6 +45,18 @@ FA_THRESHOLD = 0.02
 slice_gif_offsets = np.arange(-5, 6)
 # Calculate the frames-per-second for the animated gifs
 fps = len(slice_gif_offsets) / 2.0
+
+# Specify the image dimensions, note that SwipesForScience images should be square
+# img_height = 4.8
+# aspect_ratio = 1.0
+# img_width = aspect_ratio * img_height
+# figsize = (img_width, img_height)
+# figsize_multiplier = 1.5
+my_figsize = (7.2, 7.2)
+
+FA_ALPHA_RANGE = 7  # Plus/minus range for epit
+FA_ALPHA_OFFSET = 0.2  # minimum alpha value
+FA_ALPHA_MULT = 4  # Steepness of expit
 
 
 def parse_args():
@@ -172,15 +184,6 @@ def create_png_space(hires_maskfile, hires_anatfile):
     return pngres_mask, pngres_anat
 
 
-def mask_fa(fa_image):
-    """Turn an FA image into a mask by overwriting it."""
-    fa_img = nb.load(fa_image)
-    nb.Nifti1Image(
-        (fa_img.get_fdata() > FA_THRESHOLD).astype(np.float32),
-        fa_img.affine
-    ).to_filename(fa_image)
-
-
 def dec_in_pngspace(pngres_mask, zipped_preproc_dwi_file):
     """Fit a tensor in TORTOISE and create a DEC image in png space.
 
@@ -244,8 +247,18 @@ def dec_in_pngspace(pngres_mask, zipped_preproc_dwi_file):
     # Calculate FA
     subprocess.run(["ComputeFAMap", f"{fstem}_L1_DT.nii", "1"], check=True)
 
-    # Make the DEC Map
-    subprocess.run(["ComputeDECMap", "--input_tensor", f"{fstem}_L1_DT.nii", "--useFA"], check=True)
+    # Make the DEC Map. Not using --useFA because FA will appear in the alpha channel
+    subprocess.run(
+        [
+            "ComputeDECMap",
+            "--input_tensor",
+            f"{fstem}_L1_DT.nii",
+            "--useFA",
+            "--color_scalexp",
+            "0.3",
+        ],
+        check=True,
+    )
 
     # Resample the DEC Map into pngres space
     subprocess.run(
@@ -287,9 +300,6 @@ def dec_in_pngspace(pngres_mask, zipped_preproc_dwi_file):
         check=True,
     )
 
-    # Turn the FA Map into a mask
-    mask_fa(pngres_fa_mask)
-
     # Clean up
     os.remove(f"{fstem}_L1_DT_DEC.nii")
     os.remove(f"{fstem}_L1_DT.nii")
@@ -308,8 +318,17 @@ def get_anchor_slices_from_mask(mask_file, axis=2):
     min_slice = mask_coords.min()
     max_slice = mask_coords.max()
     covered_slices = max_slice - min_slice
-    return np.floor(
-        (covered_slices * slice_ratios[axis]) + min_slice).astype(np.int64)
+    return np.floor((covered_slices * slice_ratios[axis]) + min_slice).astype(np.int64)
+
+
+def load_and_rotate_png(pngfile, axis):
+    img = Image.open(pngfile)
+    if axis == 0:
+        return img.transpose(Image.ROTATE_90)
+    if axis == 1:
+        return img.transpose(Image.ROTATE_90)
+    if axis == 2:
+        return img.transpose(Image.ROTATE_270)
 
 
 def gifs_from_dec(dec_file, mask_file, anat_file, prefix):
@@ -345,7 +364,7 @@ def gifs_from_dec(dec_file, mask_file, anat_file, prefix):
                     "-s",
                     f"{slice_idx}x{slice_idx}",
                     "-d",
-                    f"{axis}"
+                    f"{axis}",
                 ]
 
                 if axis in (0, 1):
@@ -371,7 +390,11 @@ def gifs_from_dec(dec_file, mask_file, anat_file, prefix):
 
             # Save the gif
             imageio.mimsave(
-                output_gif_path, images, loop=0, duration=(1 / fps) * 1000, subrectangles=True
+                output_gif_path,
+                images,
+                loop=0,
+                duration=(1 / fps) * 1000,
+                subrectangles=True,
             )
 
             # Clean up the temp pngs
@@ -457,42 +480,110 @@ def create_gifs(bids_dir, subject, output_dir, session=None):
             png_dir, f"sub-{subject}_{session_name}_qcgif-".replace("__", "_")
         )
         print(f"Creating GIFs for {dwi_file}")
-        gifs_from_dec(pngres_dwi, pngres_fa_mask, pngres_anat, prefix=gif_prefix)
+        # gifs_from_dec(pngres_dwi, pngres_fa_mask, pngres_anat, prefix=gif_prefix)
+        richie_fa_gifs(pngres_dwi, pngres_fa_mask, pngres_anat, pngres_brain_mask, gif_prefix)
         print("Done")
 
 
-def ritchie_fa_plot(dec_file, fa_file, anat_file, slice_indices):
+def fa_to_alpha(
+    fa_data,
+):
+    return expit(
+        -FA_ALPHA_RANGE + FA_ALPHA_MULT * FA_ALPHA_RANGE * (fa_data + FA_ALPHA_OFFSET)
+    )
 
-    # Loop is for individual slices in the gif image
-    for gif_idx, base_slice_idx in enumerate(slice_indices):
-        images = []
-        for offset_idx, slice_offset in enumerate(slice_gif_offsets):
-            slice_idx = base_slice_idx + slice_offset
 
-            fig, ax = plt.subplots(1, 1, figsize=my_figsize)
+def richie_fa_gifs(dec_file, fa_file, anat_file, mask_file, prefix):
+    """Create GIFs for Swipes using ARH's method from HBN-POD2.
 
-            slice_anat = ndimage.rotate(b0_data[:, :, slice_idx], -90)
-            slice_rgb = ndimage.rotate(RGB[:, :, slice_idx], -90)
+    Parameters
+    ----------
 
-            fa_slice = FA_masked[:, :, slice_idx]
-            xmax = 5
-            trans_x = -xmax + 2 * xmax * (fa_slice + 0.1)
-            fa_slice = expit(trans_x)
+    dec_file: str
+        Path to an RGB DEC NIFTI file resampled into pngres space
 
-            alpha = ndimage.rotate(np.array(255 * fa_slice, "uint8"), -90)[:, :, np.newaxis]
-            slice_rgba = np.concatenate([slice_rgb, alpha], axis=-1)
+    fa_file: str
+        Path to a NIFTI file of FA values in pngres space
 
-            _ = ax.imshow(slice_anat, cmap=plt.cm.Greys_r)
-            _ = ax.imshow(slice_rgba)
-            _ = ax.axis("off")
+    anat_file: str
+        Path to anatomical file to display in grayscale behind the RBGA data.
+        Also must be in pngres space
 
-            file_path = op.join(
-                png_dir,
-                fname_gif + str(gif_idx) + "_" + str(offset_idx) + ".png"
+    mask_file: str
+        Path to the brainmask NIFTI file in pngres space
+
+    prefix: str
+        Stem of the gifs that will be written
+
+    Returns: None
+
+    """
+    # Load the RGB data. It was created by tortoise, but resampled into
+    # pngres space. This also converts it to a 3-vector data type.
+    rgb_img = nb.load(dec_file)
+    rgb_data = rgb_img.get_fdata().squeeze()
+
+    # Open FA image and turn it into alpha values
+    fa_img = nb.load(fa_file)
+    fa_data = fa_to_alpha(np.clip(0, 1, fa_img.get_fdata())) * 255
+
+    anat_img = nb.load(anat_file)
+    anat_data = anat_img.get_fdata()
+
+    def get_anat_rgba_slices(idx, axis):
+        # Select slice from axis and handle rotation
+        if axis == 0:
+            anat = anat_data[idx, :, :]
+            rgb = rgb_data[idx, :, :]
+            fa = fa_data[idx, :, :]
+        elif axis == 1:
+            anat = anat_data[:, idx, :]
+            rgb = rgb_data[:, idx, :]
+            fa = fa_data[:, idx, :]
+        else:
+            anat = anat_data[:, :, idx]
+            rgb = rgb_data[:, :, idx]
+            fa = fa_data[:, :, idx]
+        rgba = np.concatenate([rgb, fa[:, :, np.newaxis]], axis=-1)
+        return anat, rgba
+
+    # Make the gifs!
+    temp_image_files = []
+    for axis in [0, 1, 2]:
+        # Compute the indices of the slices
+        slice_indices = get_anchor_slices_from_mask(mask_file, axis)
+        axis_slice_names = slice_names[axis]
+        named_slices = zip(slice_indices, axis_slice_names)
+
+        for base_slice_idx, slice_name in named_slices:
+            output_gif_path = f"{prefix}{slice_name}.gif"
+            images = []
+
+            for offset_idx, slice_offset in enumerate(slice_gif_offsets):
+                slice_idx = base_slice_idx + slice_offset
+                slice_png_path = f"{prefix}{slice_name}_part-{offset_idx}_dec.png"
+                fig, ax = plt.subplots(1, 1, figsize=my_figsize)
+                slice_anat, slice_rgba = get_anat_rgba_slices(slice_idx, axis)
+
+                _ = ax.imshow(slice_anat, cmap=plt.cm.Greys_r)
+                _ = ax.imshow(slice_rgba.astype(np.uint8))
+                _ = ax.axis("off")
+
+                fig.savefig(slice_png_path, bbox_inches="tight")
+                plt.close(fig)
+                images.append(load_and_rotate_png(slice_png_path, axis))
+                temp_image_files.append(slice_png_path)
+
+            # Save the gif
+            imageio.mimsave(
+                output_gif_path,
+                images,
+                loop=0,
+                duration=(1 / fps) * 1000,
+                subrectangles=True,
             )
-
-            fig.savefig(file_path, bbox_inches="tight")
-            plt.close(fig)
+    for temp_image in temp_image_files:
+        os.remove(temp_image)
 
 
 if __name__ == "__main__":
