@@ -1,14 +1,5 @@
-#The base image is FreeSurfer's synthstrip package
-FROM python:3.9.16-slim-bullseye
-
-#Install relevant python packages
-RUN python3 -m pip install nibabel==3.2.2
-RUN python3 -m pip install dipy==1.6.0
-RUN python3 -m pip install matplotlib==3.3.4
-RUN python3 -m pip install scipy==1.8.0
-RUN python3 -m pip install pybids==0.16.3
-RUN python3 -m pip install imageio==2.31.2
-
+#The base image is QSIPrep
+FROM pennbbl/qsiprep:0.20.0
 
 #Make code and data directory
 RUN mkdir /hbcd_code

@@ -1,300 +1,793 @@
 #!/usr/local/bin/python3
-
-## https://github.com/richford/fibr/blob/master/notebooks/2020-11-16-cloudknot-create-color-fa-gifs.ipynb
 import warnings
-warnings.simplefilter(action='ignore', category=FutureWarning)
-import bids
-import dipy.reconst.dti as dti
-import imageio
-import matplotlib.pyplot as plt
-import numpy as np
-import os, glob
-import os.path as op
-import argparse
 
+import argparse
+import glob
+import os
+import os.path as op
+import nibabel as nb
+import bids
+import imageio
+import numpy as np
+import subprocess
+from PIL import Image
+import matplotlib.pyplot as plt
+from scipy import ndimage
+from scipy.special import expit
+from scipy.stats import scoreatpercentile
 from dipy.io.image import load_nifti, save_nifti
 from dipy.io import read_bvals_bvecs
 from dipy.core.gradients import gradient_table
-from scipy import ndimage
-from scipy.special import expit
+import dipy.reconst.dti as dti
+
+
+warnings.simplefilter(action="ignore", category=FutureWarning)
+warnings.simplefilter(action="ignore", category=DeprecationWarning)
+# Settings for the gifs
+# Specify the slices that we would like to save as a fraction
+# of the masked extent.
+slice_ratios = [
+    np.array([0.2, 0.48, 0.8]),  # LR Slices
+    np.array([0.4, 0.6]),  # AP Slices
+    np.array([0.2, 0.7]),  # IS Slices
+]
+slice_names = [
+    [
+        "LeftTemporalSagittal",
+        "LeftBrainStemSagittal",
+        "RightTemporalSagittal",
+    ],
+    [
+        "AnteriorCoronal",
+        "PosteriorCoronal",
+    ],
+    [
+        "CerebellumAxial",
+        "SemiovaleAxial",
+    ],
+]
+FA_THRESHOLD = 0.02
+# Specify that slice range for the animated gifs
+slice_gif_offsets = np.arange(-5, 6)
+# Calculate the frames-per-second for the animated gifs
+fps = len(slice_gif_offsets) / 2.0
+
+# Specify the image dimensions, note that SwipesForScience images should be square
+# img_height = 4.8
+# aspect_ratio = 1.0
+# img_width = aspect_ratio * img_height
+# figsize = (img_width, img_height)
+# figsize_multiplier = 1.5
+my_figsize = (7.2, 7.2)
+
+FA_ALPHA_RANGE = 5  # Plus/minus range for epit
+FA_ALPHA_OFFSET = 0.15  # Added to FA
+FA_ALPHA_MULT = 4  # Steepness of expit
+BRIGHTNESS_UPSCALE = 1.5
+
+PNGRES_SIZE = 90
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("qsiprep_dir", help="The path to the BIDS directory for your study (this is the same for all subjects)", type=str)
-    parser.add_argument("output_dir", help="The path to the folder where outputs will be stored (this is the same for all subjects)", type=str)
+    parser.add_argument(
+        "qsiprep_dir",
+        help="The path to the BIDS directory for your study (this is the same for all subjects)",
+        type=str,
+    )
+    parser.add_argument(
+        "output_dir",
+        help="The path to the folder where outputs will be stored (this is the same for all subjects)",
+        type=str,
+    )
     parser.add_argument("analysis_level", help="Should always be participant", type=str)
-    
-    parser.add_argument('--participant_label', '--participant-label', help="The name/label of the subject to be processed (i.e. sub-01 or 01)", type=str)
-    parser.add_argument('--session_id', '--session-id', help="OPTIONAL: the name of a specific session to be processed (i.e. ses-01)", type=str)    
-    parser.add_argument('--bids_directory', '--bids_directory', help="OPTIONAL: This is not actually used for processing.", type=str)  
+
+    parser.add_argument(
+        "--participant_label",
+        "--participant-label",
+        help="The name/label of the subject to be processed (i.e. sub-01 or 01)",
+        type=str,
+    )
+    parser.add_argument(
+        "--session_id",
+        "--session-id",
+        help="OPTIONAL: the name of a specific session to be processed (i.e. ses-01)",
+        type=str,
+    )
+    parser.add_argument(
+        "--bids_directory",
+        "--bids_directory",
+        help="OPTIONAL: This is not actually used for processing.",
+        type=str,
+    )
 
     return parser.parse_args()
 
-def create_gifs(bids_dir, subject, output_dir, session = None):
-    
+
+def create_dwires_png_space(dwi_file, hires_maskfile, hires_anatfile):
+    """Create an output space with dwi voxel size that is ideal for
+    creating square png images.
+
+    Parameters
+    ----------
+
+    dwi_file: str
+        Path to qsiprep-preprocessed dwi file
+
+    hires_maskfile: str
+        Path to the brain mask from qsiprep
+
+    hires_maskfile: str
+        Path to the brain mask from qsiprep
+
+
+
+    Returns
+    -------
+
+    pngres_maskfile: str
+        Path to the brain mask in png space
+
+    pngres_anatfile: str
+        Path to the anatomical image in png space
+
+    """
+
+    # Create a cube bounding box that we will use to take pics
+    pngres_dwi = op.abspath("pngres_dwi.nii")
+    pngres_anat = op.abspath("pngres_anat.nii")
+    pngres_dec = op.abspath("pngres_dec.nii")
+    pngres_fa = op.abspath("pngres_fa.nii")
+    pngres_mask = op.abspath("pngres_mask.nii")
+    fstem = dwi_file.replace(".nii.gz", "")
+
+    # Zeropad the DWI so it's a cube
+    subprocess.run(
+        [
+            "3dZeropad",
+            "-RL",
+            f"{PNGRES_SIZE}",
+            "-AP",
+            f"{PNGRES_SIZE}",
+            "-IS",
+            f"{PNGRES_SIZE}",
+            "-prefix",
+            pngres_dwi,
+            dwi_file,
+        ],
+        check=True,
+    )
+
+    # Get the brainmask in pngref space
+    subprocess.run(
+        [
+            "antsApplyTransforms",
+            "-d",
+            "3",
+            "-i",
+            hires_maskfile,
+            "-r",
+            pngres_dwi,
+            "-o",
+            pngres_mask,
+            "-v",
+            "1",
+            "--interpolation",
+            "NearestNeighbor",
+        ],
+        check=True,
+    )
+
+    # Resample the anat file into pngres
+    subprocess.run(
+        [
+            "antsApplyTransforms",
+            "-d",
+            "3",
+            "-i",
+            hires_anatfile,
+            "-r",
+            pngres_dwi,
+            "-o",
+            pngres_anat,
+            "-v",
+            "1",
+            "--interpolation",
+            "NearestNeighbor",
+        ],
+        check=True,
+    )
+
+    # Use DIPY to fit a tensor
+    data, affine = load_nifti(pngres_dwi)
+    mask_data, _ = load_nifti(pngres_mask)
+    bvals, bvecs = read_bvals_bvecs(f"{fstem}.bval", f"{fstem}.bvec")
+    gtab = gradient_table(bvals, bvecs)
+    tenmodel = dti.TensorModel(gtab)
+    print(f"Fitting Tensor to {dwi_file}")
+    tenfit = tenmodel.fit(data, mask=mask_data > 0)
+
+    # Get FA and DEC from the tensor fit
+    FA = dti.fractional_anisotropy(tenfit.evals)
+    FA = np.clip(FA, 0, 1)
+
+    # Convert to colorFA image as in DIPY documentation
+    FA_masked = FA * mask_data
+    RGB = dti.color_fa(FA_masked, tenfit.evecs)
+    RGB = np.array(255 * RGB, 'uint8')
+    save_nifti(pngres_fa, FA_masked.astype(np.float32), affine)
+    save_nifti(pngres_dec, RGB, affine)
+
+    return pngres_dec, pngres_fa, pngres_anat, pngres_mask
+
+
+def create_hires_png_space(hires_maskfile, hires_anatfile):
+    """Create an output space that is ideal for creating square png images.
+
+    Parameters
+    ----------
+
+    hires_maskfile: str
+        Path to the brain mask from qsiprep
+
+    hires_anatfile: str
+        Path to high-res anatomical image from qsiprep. Can be T1w or T2w
+
+
+    Returns
+    -------
+
+    pngres_maskfile: str
+        Path to the brain mask in png space
+
+    pngres_anatfile: str
+        Path to the anatomical image in png space
+
+    """
+
+    # Create a cube bounding box that we will use to take pics
+    pngres_anat = op.abspath("pngres_anatomical.nii")
+    pngres_mask = op.abspath("pngres_mask.nii")
+
+    subprocess.run(
+        ["3dAutobox", "-prefix", "_mask_box.nii", hires_maskfile],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "3dZeropad",
+            "-RL",
+            "128",
+            "-AP",
+            "128",
+            "-IS",
+            "128",
+            "-prefix",
+            pngres_mask,
+            "_mask_box.nii",
+        ],
+        check=True,
+    )
+
+    # Get the brainmask in pngref space
+    subprocess.run(
+        [
+            "antsApplyTransforms",
+            "-d",
+            "3",
+            "-i",
+            hires_anatfile,
+            "-r",
+            pngres_mask,
+            "-o",
+            pngres_anat,
+            "-v",
+            "1",
+            "--interpolation",
+            "NearestNeighbor",
+        ],
+        check=True,
+    )
+
+    # Scale it nicely so the DEC pops
+    subprocess.run(
+        [
+            "ImageMath",
+            "3",
+            pngres_anat,
+            "TruncateImageIntensity",
+            pngres_anat,
+            "0.02",
+            "0.98",
+            "256",
+        ],
+        check=True,
+    )
+
+    # Clean up
+    os.remove("_mask_box.nii")
+
+    return pngres_mask, pngres_anat
+
+
+def dec_in_pngspace(pngres_mask, zipped_preproc_dwi_file):
+    """Fit a tensor in TORTOISE and create a DEC image in png space.
+
+    Parameters
+    ----------
+
+    pngres_mask: str
+        Path to the binary brain mask file in png space
+
+    zipped_preproc_dwi_file: str
+        Path to the gzipped, preprocessed nifti file from qsiprep
+
+
+    Returns
+    -------
+
+    pngres_dec: str
+        Path to the RGB-valued DEC image in png space
+    """
+    pngres_dec = op.abspath("pngres_dec.nii")
+    dwires_anat_mask = op.abspath("dwires_anat_mask.nii")
+    pngres_fa_mask = op.abspath("pngres_fa_mask.nii")
+
+    # Unzip the dwi file
+    subprocess.run(["gunzip", zipped_preproc_dwi_file])
+    preproc_dwi_file = op.abspath(zipped_preproc_dwi_file.replace(".gz", ""))
+    fstem = preproc_dwi_file.replace(".nii", "")
+
+    # Resample the mask into the dwi space
+    subprocess.run(
+        [
+            "antsApplyTransforms",
+            "-d",
+            "3",
+            "--interpolation",
+            "NearestNeighbor",
+            "-o",
+            dwires_anat_mask,
+            "-i",
+            pngres_mask,
+            "-r",
+            preproc_dwi_file,
+        ],
+        check=True,
+    )
+
+    # Convert bval, bvec to bmat
+    subprocess.run(["FSLBVecsToTORTOISEBmatrix", f"{fstem}.bval", f"{fstem}.bvec"])
+
+    # Estimate the tensor (the bmtxt is automatically found)
+    subprocess.run(
+        [
+            "EstimateTensor",
+            "--input",
+            preproc_dwi_file,
+            "--mask",
+            dwires_anat_mask,
+        ],
+        check=True,
+    )
+    # Calculate FA
+    subprocess.run(["ComputeFAMap", f"{fstem}_L1_DT.nii", "1"], check=True)
+
+    # Make the DEC Map. Not using --useFA because FA will appear in the alpha channel
+    subprocess.run(
+        [
+            "ComputeDECMap",
+            "--input_tensor",
+            f"{fstem}_L1_DT.nii",
+            "--useFA",
+            "--color_scalexp",
+            "0.3",
+        ],
+        check=True,
+    )
+
+    # Resample the DEC Map into pngres space
+    subprocess.run(
+        [
+            "antsApplyTransforms",
+            "-d",
+            "3",
+            "-e",
+            "4",
+            "--interpolation",
+            "NearestNeighbor",
+            "-o",
+            pngres_dec,
+            "-i",
+            f"{fstem}_L1_DT_DEC.nii",
+            "-r",
+            pngres_mask,
+        ],
+        check=True,
+    )
+
+    # Resample the FA Map into pngres space
+    subprocess.run(
+        [
+            "antsApplyTransforms",
+            "-d",
+            "3",
+            "-e",
+            "4",
+            "--interpolation",
+            "NearestNeighbor",
+            "-o",
+            pngres_fa_mask,
+            "-i",
+            f"{fstem}_L1_DT_FA.nii",
+            "-r",
+            pngres_mask,
+        ],
+        check=True,
+    )
+
+    # Clean up
+    os.remove(f"{fstem}_L1_DT_DEC.nii")
+    os.remove(f"{fstem}_L1_DT.nii")
+    os.remove(f"{fstem}_L1_DT_FA.nii")
+    os.remove(f"{fstem}_L1_AM.nii")
+    os.remove(dwires_anat_mask)
+    # os.remove(preproc_dwi_file)  # This is the unzipped nii, the original stays
+
+    return pngres_dec, pngres_fa_mask
+
+
+def get_anchor_slices_from_mask(mask_file, axis):
+    """Find the slice numbers for ``slice_ratios`` inside a mask."""
+    mask_arr = nb.load(mask_file).get_fdata()
+    mask_coords = np.argwhere(mask_arr > 0)[:, axis]
+    min_slice = mask_coords.min()
+    max_slice = mask_coords.max()
+    covered_slices = max_slice - min_slice
+    return np.floor((covered_slices * slice_ratios[axis]) + min_slice).astype(np.int64)
+
+
+def load_and_rotate_png(pngfile, axis):
+    img = Image.open(pngfile)
+    if axis == 0:
+        return img.transpose(Image.ROTATE_90)
+    if axis == 1:
+        return img.transpose(Image.ROTATE_90)
+    if axis == 2:
+        return img.transpose(Image.ROTATE_270)
+
+
+def gifs_from_dec(dec_file, mask_file, anat_file, prefix):
+    """Create a series of animated gifs from DEC+anatomical images."""
+
+    # Loop is for individual slices in the gif image
+    for axis in [0, 1, 2]:
+        # Compute the indices of the slices
+        slice_indices = get_anchor_slices_from_mask(mask_file, axis)
+        axis_slice_names = slice_names[axis]
+        named_slices = zip(slice_indices, axis_slice_names)
+        for base_slice_idx, slice_name in named_slices:
+            output_gif_path = f"{prefix}{slice_name}.gif"
+            images = []
+            image_files = []
+            for offset_idx, slice_offset in enumerate(slice_gif_offsets):
+                slice_idx = base_slice_idx + slice_offset
+                slice_png_path = f"{prefix}{slice_name}_part-{offset_idx}_dec.png"
+                cmd = [
+                    "CreateTiledMosaic",
+                    "-i",
+                    anat_file,
+                    "-r",
+                    dec_file,
+                    "-a",
+                    "0.65",
+                    "-x",
+                    mask_file,
+                    "-t",
+                    "1x1",
+                    "-o",
+                    slice_png_path,
+                    "-s",
+                    f"{slice_idx}x{slice_idx}",
+                    "-d",
+                    f"{axis}",
+                ]
+
+                if axis in (0, 1):
+                    cmd += ["-f", "0x1"]
+
+                # Run CreateTiledMosaic to get a png
+                subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+
+                # Upsample the image ONCE
+                ants_png = Image.open(slice_png_path)
+                resized = ants_png.resize((512, 512), Image.NEAREST)
+                images.append(resized)
+                image_files.append(slice_png_path)
+
+            # Create a back and forth animation by appending the images to
+            # themselves, but reversed
+            images = images + images[-2:0:-1]
+
+            # Save the gif
+            imageio.mimsave(
+                output_gif_path,
+                images,
+                loop=0,
+                duration=(1 / fps) * 1000,
+                subrectangles=True,
+            )
+
+            # Clean up the temp pngs
+            for imagef in image_files:
+                os.remove(imagef)
+
+
+def create_gifs(bids_dir, subject, output_dir, session=None):
+    """Create DEC+anat animated gifs from QSIPrep outputs.
+
+    Parameters
+    ----------
+
+    bids_dir: str
+        Path to QSIPrep outputs (A BIDS derivatives dataset)
+
+    subject: str
+        Subject ID to process
+
+    output_dir: str
+        Directory where gifs will go, in a BIDSlike layout
+
+    session: str
+        Filter for session. If omitted create gifs from all sessions
+
+    Returns
+    -------
+
+    None
+
+    """
     # Download that particular subject to a local folder
     layout = bids.BIDSLayout(bids_dir, validate=False)
 
-    # Specify the slices that we would like to save as a fraction of total number of slices
-    scale_fa = True
-    slice_ratios = np.linspace(0.4, 0.6, 4, endpoint=True)
-    slice_ratios[0] = 0.42
-    slice_ratios[-1] = 0.58
-    
-    # Specify that slice range for the animated gifs
-    slice_gif_offsets = np.arange(-5, 6)
-    
-    # Calculate the frames-per-second for the animated gifs
-    fps = len(slice_gif_offsets) / 2.0
-    
-    # Specify the image dimensions, note that SwipesForScience images should be square
-    img_height = 4.8
-    aspect_ratio = 1.0
-    img_width = aspect_ratio * img_height
-    figsize = (img_width, img_height)
-
     # Specify local filenames
     subject = subject.replace("sub-", "")
-    fname_gif = f"sub-{subject}_desc-b0colorfa_slice-"
-    fname_fa = f"sub-{subject}_tensor_fa.nii.gz"
-    fname_rgb = f"sub-{subject}_tensor_rgb.nii.gz"
-    
+
     # Use pybids to grab the necessary image files
     initial_bids_filters = {"subject": subject, "return_type": "filename"}
-    if type(session) != type(None):
-        initial_bids_filters["session"] = session
-    fb0s = layout.get(suffix="dwiref", extension="nii.gz", **initial_bids_filters)
-    for i, temp_fb0 in enumerate(fb0s):
 
-        temp_fb0_split = temp_fb0.split('/')[-1].split('_')[:-1]
-        temp_entities = {}
-        fname_gif = f"sub-{subject}"
-        fname_fa = f"sub-{subject}"
-        fname_rgb = f"sub-{subject}"
-        for temp_split in temp_fb0_split:
-            temp_split_split = temp_split.split('-')
-            temp_entities[temp_split_split[0]] = temp_split_split[1]
-        if 'ses' in temp_entities.keys():
-            fname_gif = f"{fname_gif}_ses-{temp_entities['ses']}"
-            fname_fa = f"{fname_fa}_ses-{temp_entities['ses']}"
-            fname_rgb = f"{fname_rgb}_ses-{temp_entities['ses']}"
-        if 'run' in temp_entities.keys():
-            run_specific_bids_filters = initial_bids_filters.copy()
-            run_specific_bids_filters['run'] = temp_entities['run']
-            fname_gif = f"{fname_gif}_run-{temp_entities['run']}"
-            fname_fa = f"{fname_fa}_run-{temp_entities['run']}"
-            fname_rgb = f"{fname_rgb}_run-{temp_entities['run']}"
-        else:
-            run_specific_bids_filters = initial_bids_filters.copy()
-
-        fname_gif = f"{fname_gif}_desc-b0colorfa_slice-"
-        fname_fa = f"{fname_fa}_tensor_fa.nii.gz"
-        fname_rgb = f"{fname_rgb}_tensor_rgb.nii.gz"
-    
-        fb0 = layout.get(suffix="dwiref", extension="nii.gz", **run_specific_bids_filters)[0]
-        fdwi= layout.get(suffix="dwi", extension="nii.gz", **run_specific_bids_filters)[0]
-        fmask = layout.get(suffix="mask", datatype="dwi", extension="nii.gz", **run_specific_bids_filters)[0]
-    
-        # Load the niftis
-        b0_data, b0_affine = load_nifti(fb0)
-        t1w_data, t1w_affine = load_nifti(fb0)
-        mask_data, mask_affine = load_nifti(fmask)
-        data, affine = load_nifti(fdwi)
-        
-        # Load the gradient table
-        fbval = layout.get_bval(path=fdwi, subject=subject)
-        fbvec = layout.get_bvec(path=fdwi, subject=subject)
-        bvals, bvecs = read_bvals_bvecs(fbval, fbvec)
-        gtab = gradient_table(bvals, bvecs)
-
-        # Fit a tensor model and compute FA
-        tenmodel = dti.TensorModel(gtab)
-        tenfit = tenmodel.fit(data)
-        FA = dti.fractional_anisotropy(tenfit.evals)
-        FA = np.clip(FA, 0, 1)
-
-        # Convert to colorFA image as in DIPY documentation
-        FA_masked = FA * mask_data
-        RGB = dti.color_fa(FA_masked, tenfit.evecs)
-
-        RGB = np.array(255 * RGB, 'uint8')
-        save_nifti(fname_fa, FA_masked.astype(np.float32), affine)
-        save_nifti(fname_rgb, RGB, affine) 
-    
-    def trim_zeros(arr, margin=0, trim_dims=None):
-        '''
-        Trim the leading and trailing zeros from a N-D array.
-
-        :param arr: numpy array
-        :param margin: how many zeros to leave as a margin
-        :returns: trimmed array
-        :returns: slice object
-        '''
-        s = []
-        if trim_dims is None:
-            trim_dims = list(range(arr.ndim))
-
-        for dim in range(arr.ndim):
-            start = 0
-            end = -1
-
-            if dim in trim_dims:
-                slice_ = [slice(None)]*arr.ndim
-
-                go = True
-                while go:
-                    slice_[dim] = start
-                    go = not np.any(arr[tuple(slice_)])
-                    start += 1
-                start = max(start-1-margin, 0)
-
-                go = True
-                while go:
-                    slice_[dim] = end
-                    go = not np.any(arr[tuple(slice_)])
-                    end -= 1
-                end = arr.shape[dim] + min(-1, end+1+margin) + 1
-
-                s.append(slice(start,end))
-            else:
-                s.append(slice(None, None, None))
-        return arr[tuple(s)], tuple(s)
-        
-    def pad_square_2d(arr):
-        """Pad a slice so that it is square"""
-        dim_x, dim_y = arr.shape[0], arr.shape[1]
-        dim_max = max(dim_x, dim_y)
-        pad_xr = (dim_max - dim_x) // 2
-        pad_xl = dim_max - dim_x - pad_xr
-        pad_yr = (dim_max - dim_y) // 2
-        pad_yl = dim_max - dim_y - pad_yr
-
-        pad_width = [(pad_xl, pad_xr), (pad_yl, pad_yr)]
-        for i in range(arr.ndim - 2):
-            pad_width.append((0, 0))
-        return np.pad(arr, pad_width=pad_width)
-
-    # Compute the indices of the slices
-    slice_indices = np.array(slice_ratios * b0_data.shape[-1], dtype="uint8")
-
-    # Trim zeros off of everything
-    mask_trim, trim_slices = trim_zeros(mask_data, margin=5, trim_dims=(0, 1))
-    t1w_data = t1w_data[trim_slices]
-    b0_data = b0_data[trim_slices]
-    RGB = RGB[trim_slices + (slice(None, None, None),)]
-    FA_masked = FA_masked[trim_slices]
-    
-    # Square everything
-    t1w_data = pad_square_2d(t1w_data)
-    RGB = pad_square_2d(RGB)
-    FA_masked = pad_square_2d(FA_masked)
-    b0_data = pad_square_2d(b0_data)
+    # Prepare the PNG space and get the anatomical data resampled into it
+    anat_mask_file = layout.get(
+        suffix="mask",
+        datatype="anat",
+        extension="nii.gz",
+        **initial_bids_filters,
+    )
+    if not anat_mask_file:
+        raise Exception(f"No anatomical brain mask produced for {subject}")
+    anat_mask_file = anat_mask_file[0]
+    # We get a T2w for HBCD
+    anat_hires_file = layout.get(
+        suffix="T2w",
+        datatype="anat",
+        **initial_bids_filters,
+    )
+    if not anat_hires_file:
+        raise Exception(f"No high-res T2w image found for f{subject}")
+    anat_hires_file = anat_hires_file[0]
 
     # Create the local output dir
-    if type(session) != type(None):
-        session_name = session
+    if session is not None:
+        session_name = f"ses-{session}"
     else:
-        session_name = ''
-    png_dir = os.path.join(output_dir, 'sub-' + subject, 'ses-' + session_name, 'dwi')
+        session_name = ""
+    png_dir = op.join(output_dir, f"sub-{subject}/{session_name}/dwi").replace(
+        "//", "/"
+    )
     os.makedirs(png_dir, exist_ok=True)
-    
-    # Enlarge images
-    figsize_multiplier = 1.5
-    my_figsize = tuple(x * figsize_multiplier for x in figsize)
-    
-    # Loop is for individual slices in the gif image
-    for gif_idx, base_slice_idx in enumerate(slice_indices):
-        images = []
-        for offset_idx, slice_offset in enumerate(slice_gif_offsets):
-            slice_idx = base_slice_idx + slice_offset
 
-            fig, ax = plt.subplots(1, 1, figsize=my_figsize)
+    # The anatomical outputs from QSIPrep v<1.0
+    # cannot be in session directories
+    # Add this filter after we've found the anatomical data
+    if session is not None:
+        initial_bids_filters["session"] = session
 
-            slice_anat = ndimage.rotate(b0_data[:, :, slice_idx], -90)
-            slice_rgb = ndimage.rotate(RGB[:, :, slice_idx], -90)
+    # Find all the dwi files, and their corresponding dwi files
+    dwi_files = layout.get(suffix="dwi", extension="nii.gz", **initial_bids_filters)
+    for dwi_file in dwi_files:
+        pngres_dec, pngres_fa, pngres_anat, pngres_brain_mask = create_dwires_png_space(
+            dwi_file,
+            anat_mask_file,
+            anat_hires_file)
 
-            fa_slice = FA_masked[:, :, slice_idx]
-            if scale_fa:
-                xmax = 5
-                trans_x = -xmax + 2 * xmax * (fa_slice + 0.1)
-                fa_slice = expit(trans_x)
-
-            alpha = ndimage.rotate(np.array(255 * fa_slice, "uint8"), -90)[:, :, np.newaxis]
-            slice_rgba = np.concatenate([slice_rgb, alpha], axis=-1)
-
-            _ = ax.imshow(slice_anat, cmap=plt.cm.Greys_r)
-            _ = ax.imshow(slice_rgba)
-            _ = ax.axis("off")
-            
-            file_path = op.join(
-                png_dir,
-                fname_gif + str(gif_idx) + "_" + str(offset_idx) + ".png"
-            )
-            
-            fig.savefig(file_path, bbox_inches="tight")
-            plt.close(fig)
-
-            images.append(imageio.imread(file_path))
-
-        images = images + images[-2:0:-1]
-
-        file_path = op.join(
-            png_dir,
-            fname_gif + str(gif_idx) + ".gif"
+        gif_prefix = op.join(
+            png_dir, f"sub-{subject}_{session_name}_qcgif-".replace("__", "_")
         )
-        
-        # Save the gif
-        imageio.mimsave(file_path, images, loop=0, duration=(1/fps)*1000, subrectangles=True)
-            
-
-#Grab the arg parse inputs 
-args = parse_args()
-cwd = os.getcwd()
-
-#reassign variables to command line input
-qsiprep_dir = args.qsiprep_dir
-if os.path.isabs(qsiprep_dir) == False:
-    qsiprep_dir = os.path.join(cwd, qsiprep_dir)
-output_dir = args.output_dir
-if os.path.isabs(output_dir) == False:
-    output_dir = os.path.join(cwd, output_dir)
-analysis_level = args.analysis_level
-if analysis_level != 'participant':
-    raise ValueError('Error: analysis level must be participant, but program received: ' + analysis_level)
-
-if args.participant_label:
-    pass
-else:
-    os.chdir(qsiprep_dir)
-    participants = glob.glob('sub-*')
-
-for temp_participant in participants:
-
-    #Find sessions... if session was provided then
-    #process that specific session. Otherwise iterate
-    #through all sessions or continue without assumption
-    #of sessions if no sessions are found in the BIDS
-    #structure
-
-    #This is mainly to weed out html reports...
-    dwi_path_sessions = os.path.join(qsiprep_dir, temp_participant, 'ses*', 'dwi')
-    dwi_path_no_sessions = os.path.join(qsiprep_dir, temp_participant, 'ses*')
-    if len(glob.glob(dwi_path_sessions)) + len(glob.glob(dwi_path_no_sessions)) == 0:
-        continue
+        print(f"Creating GIFs for {dwi_file}")
+        # gifs_from_dec(pngres_dwi, pngres_fa_mask, pngres_anat, prefix=gif_prefix)
+        richie_fa_gifs(pngres_dec, pngres_fa, pngres_anat, pngres_brain_mask, gif_prefix)
+        print("Done")
 
 
-    if args.session_id:
+def fa_to_alpha(
+    fa_data,
+):
+    return expit(
+        -FA_ALPHA_RANGE + FA_ALPHA_MULT * FA_ALPHA_RANGE * (fa_data + FA_ALPHA_OFFSET)
+    )
+
+
+def richie_fa_gifs(dec_file, fa_file, anat_file, mask_file, prefix):
+    """Create GIFs for Swipes using ARH's method from HBN-POD2.
+
+    Parameters
+    ----------
+
+    dec_file: str
+        Path to an RGB DEC NIFTI file resampled into pngres space
+
+    fa_file: str
+        Path to a NIFTI file of FA values in pngres space
+
+    anat_file: str
+        Path to anatomical file to display in grayscale behind the RBGA data.
+        Also must be in pngres space
+
+    mask_file: str
+        Path to the brainmask NIFTI file in pngres space
+
+    prefix: str
+        Stem of the gifs that will be written
+
+    Returns: None
+
+    """
+    # Load the RGB data. It was created by tortoise, but resampled into
+    # pngres space. This also converts it to a 3-vector data type.
+    rgb_img = nb.load(dec_file)
+    rgb_data = rgb_img.get_fdata().squeeze()
+    rgb_data = np.clip(0, 255, rgb_data * BRIGHTNESS_UPSCALE)
+
+    # Open FA image and turn it into alpha values
+    fa_img = nb.load(fa_file)
+    fa_data = fa_to_alpha(np.clip(0, 1, fa_img.get_fdata())) * 255
+
+    anat_img = nb.load(anat_file)
+    anat_data = anat_img.get_fdata()
+    anat_vmin, anat_vmax = scoreatpercentile(anat_data.flatten(), [1, 98])
+
+    print(f"Setting grayscale vmax to {anat_vmax}")
+
+    def get_anat_rgba_slices(idx, axis):
+        # Select slice from axis and handle rotation
+        if axis == 0:
+            anat = anat_data[idx, :, :]
+            rgb = rgb_data[idx, :, :]
+            fa = fa_data[idx, :, :]
+        elif axis == 1:
+            anat = anat_data[:, idx, :]
+            rgb = rgb_data[:, idx, :]
+            fa = fa_data[:, idx, :]
+        else:
+            anat = anat_data[:, :, idx]
+            rgb = rgb_data[:, :, idx]
+            fa = fa_data[:, :, idx]
+        rgba = np.concatenate([rgb, fa[:, :, np.newaxis]], axis=-1)
+        return anat, rgba
+
+    # Make the gifs!
+    temp_image_files = []
+    for axis in [0, 1, 2]:
+        # Compute the indices of the slices
+        slice_indices = get_anchor_slices_from_mask(mask_file, axis)
+        axis_slice_names = slice_names[axis]
+        named_slices = zip(slice_indices, axis_slice_names)
+
+        for base_slice_idx, slice_name in named_slices:
+            output_gif_path = f"{prefix}{slice_name}.gif"
+            images = []
+
+            for offset_idx, slice_offset in enumerate(slice_gif_offsets):
+                slice_idx = base_slice_idx + slice_offset
+                slice_png_path = f"{prefix}{slice_name}_part-{offset_idx}_dec.png"
+                fig, ax = plt.subplots(1, 1, figsize=my_figsize)
+                slice_anat, slice_rgba = get_anat_rgba_slices(slice_idx, axis)
+
+                _ = ax.imshow(
+                    slice_anat,
+                    vmin=anat_vmin,
+                    vmax=anat_vmax,
+                    cmap=plt.cm.Greys_r,
+                )
+                _ = ax.imshow(slice_rgba.astype(np.uint8))
+                _ = ax.axis("off")
+
+                fig.savefig(slice_png_path, bbox_inches="tight")
+                plt.close(fig)
+                images.append(load_and_rotate_png(slice_png_path, axis))
+                temp_image_files.append(slice_png_path)
+
+            # Create a back and forth animation by appending the images to
+            # themselves, but reversed
+            images = images + images[-2:0:-1]
+
+            # Save the gif
+            imageio.mimsave(
+                output_gif_path,
+                images,
+                loop=0,
+                duration=(1 / fps) * 1000,
+                subrectangles=True,
+            )
+
+    # Clean up the
+    for temp_image in temp_image_files:
+        os.remove(temp_image)
+
+
+if __name__ == "__main__":
+    # Grab the arg parse inputs
+    args = parse_args()
+    cwd = os.getcwd()
+
+    # reassign variables to command line input
+    qsiprep_dir = args.qsiprep_dir
+    if not os.path.isabs(qsiprep_dir):
+        qsiprep_dir = os.path.join(cwd, qsiprep_dir)
+    output_dir = args.output_dir
+    if not os.path.isabs(output_dir):
+        output_dir = os.path.join(cwd, output_dir)
+    analysis_level = args.analysis_level
+    if analysis_level != "participant":
+        raise ValueError(
+            "Error: analysis level must be participant, but program received: "
+            + analysis_level
+        )
+
+    if args.participant_label:
         pass
     else:
-        os.chdir(os.path.join(qsiprep_dir, temp_participant))
-        sessions = glob.glob('ses-*')
-        if len(sessions) == 0:
-            sessions = None
+        os.chdir(qsiprep_dir)
+        participants = glob.glob("sub-*")
 
-    for temp_session in sessions:
+    for temp_participant in participants:
 
-        if type(temp_session) != type(None):
-            temp_session = temp_session.split('-')[1]
+        # Find sessions... if session was provided then
+        # process that specific session. Otherwise iterate
+        # through all sessions or continue without assumption
+        # of sessions if no sessions are found in the BIDS
+        # structure
 
-        create_gifs(qsiprep_dir, temp_participant.split('-')[-1], output_dir, session = temp_session)
+        # This is mainly to weed out html reports...
+        dwi_path_sessions = os.path.join(qsiprep_dir, temp_participant, "ses*", "dwi")
+        dwi_path_no_sessions = os.path.join(qsiprep_dir, temp_participant, "ses*")
+        if (
+            len(glob.glob(dwi_path_sessions)) + len(glob.glob(dwi_path_no_sessions))
+            == 0
+        ):
+            continue
+
+        if args.session_id:
+            pass
+        else:
+            os.chdir(os.path.join(qsiprep_dir, temp_participant))
+            sessions = glob.glob("ses-*")
+            if len(sessions) == 0:
+                sessions = None
+
+        for temp_session in sessions:
+
+            if temp_session is not None:
+                temp_session = temp_session.split("-")[1]
+
+            create_gifs(
+                qsiprep_dir,
+                temp_participant.split("-")[-1],
+                output_dir,
+                session=temp_session,
+            )
