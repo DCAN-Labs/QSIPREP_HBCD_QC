@@ -1,4 +1,4 @@
-#!/usr/local/bin/python3
+#!/usr/local/miniconda/bin/python
 import warnings
 
 import argparse
