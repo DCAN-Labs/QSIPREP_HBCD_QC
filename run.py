@@ -61,9 +61,9 @@ fps = len(slice_gif_offsets) / 2.0
 my_figsize = (7.2, 7.2)
 
 FA_ALPHA_RANGE = 5  # Plus/minus range for epit
-FA_ALPHA_OFFSET = 0.15  # Added to FA
+FA_ALPHA_OFFSET = 0.17  # Added to FA
 FA_ALPHA_MULT = 4  # Steepness of expit
-BRIGHTNESS_UPSCALE = 1.5
+BRIGHTNESS_UPSCALE = 2.0
 
 PNGRES_SIZE = 90
 
@@ -104,7 +104,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def create_dwires_png_space(dwi_file, hires_maskfile, hires_anatfile):
+def create_dwires_png_space(dwi_file, hires_maskfile, hires_anatfile, res="dwi"):
     """Create an output space with dwi voxel size that is ideal for
     creating square png images.
 
@@ -115,12 +115,15 @@ def create_dwires_png_space(dwi_file, hires_maskfile, hires_anatfile):
         Path to qsiprep-preprocessed dwi file
 
     hires_maskfile: str
-        Path to the brain mask from qsiprep
+        Path to the brain mask from qsiprep. If res is "anat" it should be a 
+        cube already
 
-    hires_maskfile: str
-        Path to the brain mask from qsiprep
+    hires_anatfile: str
+        Path to the brain mask from qsiprep. If res is "anat" it should be a 
+        cube already
 
-
+    res : str
+        "dwi" or "anat" - which resolution to do calculations in
 
     Returns
     -------
@@ -134,69 +137,93 @@ def create_dwires_png_space(dwi_file, hires_maskfile, hires_anatfile):
     """
 
     # Create a cube bounding box that we will use to take pics
-    pngres_dwi = op.abspath("pngres_dwi.nii")
-    pngres_anat = op.abspath("pngres_anat.nii")
-    pngres_dec = op.abspath("pngres_dec.nii")
-    pngres_fa = op.abspath("pngres_fa.nii")
-    pngres_mask = op.abspath("pngres_mask.nii")
+    pngres_dwi = op.abspath(f"{res}pngres_dwi.nii")
+    pngres_anat = op.abspath(f"{res}pngres_anat.nii")
+    pngres_dec = op.abspath(f"{res}pngres_dec.nii")
+    pngres_fa = op.abspath(f"{res}pngres_fa.nii")
+    pngres_mask = op.abspath(f"{res}pngres_mask.nii")
     fstem = dwi_file.replace(".nii.gz", "")
 
-    # Zeropad the DWI so it's a cube
-    subprocess.run(
-        [
-            "3dZeropad",
-            "-RL",
-            f"{PNGRES_SIZE}",
-            "-AP",
-            f"{PNGRES_SIZE}",
-            "-IS",
-            f"{PNGRES_SIZE}",
-            "-prefix",
-            pngres_dwi,
-            dwi_file,
-        ],
-        check=True,
-    )
+    if res == "dwi":
+        # Zeropad the DWI so it's a cube
+        subprocess.run(
+            [
+                "3dZeropad",
+                "-RL",
+                f"{PNGRES_SIZE}",
+                "-AP",
+                f"{PNGRES_SIZE}",
+                "-IS",
+                f"{PNGRES_SIZE}",
+                "-prefix",
+                pngres_dwi,
+                dwi_file,
+            ],
+            check=True,
+        )
 
-    # Get the brainmask in pngref space
-    subprocess.run(
-        [
-            "antsApplyTransforms",
-            "-d",
-            "3",
-            "-i",
-            hires_maskfile,
-            "-r",
-            pngres_dwi,
-            "-o",
-            pngres_mask,
-            "-v",
-            "1",
-            "--interpolation",
-            "NearestNeighbor",
-        ],
-        check=True,
-    )
+        # Get the brainmask in pngref space
+        subprocess.run(
+            [
+                "antsApplyTransforms",
+                "-d",
+                "3",
+                "-i",
+                hires_maskfile,
+                "-r",
+                pngres_dwi,
+                "-o",
+                pngres_mask,
+                "-v",
+                "1",
+                "--interpolation",
+                "NearestNeighbor",
+            ],
+            check=True,
+        )
 
-    # Resample the anat file into pngres
-    subprocess.run(
-        [
-            "antsApplyTransforms",
-            "-d",
-            "3",
-            "-i",
-            hires_anatfile,
-            "-r",
-            pngres_dwi,
-            "-o",
-            pngres_anat,
-            "-v",
-            "1",
-            "--interpolation",
-            "NearestNeighbor",
-        ],
-        check=True,
-    )
+        # Resample the anat file into pngres
+        subprocess.run(
+            [
+                "antsApplyTransforms",
+                "-d",
+                "3",
+                "-i",
+                hires_anatfile,
+                "-r",
+                pngres_dwi,
+                "-o",
+                pngres_anat,
+                "-v",
+                "1",
+                "--interpolation",
+                "NearestNeighbor",
+            ],
+            check=True,
+        )
+    elif res == "anat":
+        subprocess.run(
+            [
+                "antsApplyTransforms",
+                "-d",
+                "3",
+                "-e",
+                "3",
+                "-i",
+                dwi_file,
+                "-r",
+                hires_maskfile,
+                "-o",
+                pngres_dwi,
+                "-v",
+                "1",
+                "--interpolation",
+                "BSpline",
+            ],
+            check=True,
+        )
+        pngres_mask = hires_maskfile
+        pngres_anat = hires_anatfile
 
     # Use DIPY to fit a tensor
     data, affine = load_nifti(pngres_dwi)
@@ -204,7 +231,7 @@ def create_dwires_png_space(dwi_file, hires_maskfile, hires_anatfile):
     bvals, bvecs = read_bvals_bvecs(f"{fstem}.bval", f"{fstem}.bvec")
     gtab = gradient_table(bvals, bvecs)
     tenmodel = dti.TensorModel(gtab)
-    print(f"Fitting Tensor to {dwi_file}")
+    print(f"Fitting Tensor to {pngres_dwi}")
     tenfit = tenmodel.fit(data, mask=mask_data > 0)
 
     # Get FA and DEC from the tensor fit
@@ -597,20 +624,39 @@ def create_gifs(bids_dir, subject, output_dir, session=None):
     if session is not None:
         initial_bids_filters["session"] = session
 
+    # get the hires anatomical data into a nice cube
+    hirescube_mask_file, hirescube_anat_file = create_hires_png_space(anat_mask_file, anat_hires_file)
+
     # Find all the dwi files, and their corresponding dwi files
     dwi_files = layout.get(suffix="dwi", extension="nii.gz", **initial_bids_filters)
     for dwi_file in dwi_files:
+        print(f"Creating GIFs for {dwi_file}")
         pngres_dec, pngres_fa, pngres_anat, pngres_brain_mask = create_dwires_png_space(
             dwi_file,
             anat_mask_file,
-            anat_hires_file)
-
-        gif_prefix = op.join(
-            png_dir, f"sub-{subject}_{session_name}_qcgif-".replace("__", "_")
+            anat_hires_file,
+            res="dwi",
         )
-        print(f"Creating GIFs for {dwi_file}")
-        # gifs_from_dec(pngres_dwi, pngres_fa_mask, pngres_anat, prefix=gif_prefix)
+
+        # Do the low-res version
+        gif_prefix = op.join(
+            png_dir, f"sub-{subject}_{session_name}_res-dwi_qcgif-".replace("__", "_")
+        )
         richie_fa_gifs(pngres_dec, pngres_fa, pngres_anat, pngres_brain_mask, gif_prefix)
+
+        # Do the hi-res version
+        print(f"Creating Hi-Res GIFs for {dwi_file}")
+        pnghires_dec, pnghires_fa, _, _ = create_dwires_png_space(
+            dwi_file,
+            hirescube_mask_file,
+            hirescube_anat_file,
+            res="anat"
+        )
+        hires_gif_prefix = op.join(
+            png_dir, f"sub-{subject}_{session_name}_res-anat_qcgif-".replace("__", "_")
+        )
+        richie_fa_gifs(pnghires_dec, pnghires_fa, hirescube_anat_file, hirescube_mask_file, hires_gif_prefix)
+
         print("Done")
 
 
@@ -647,6 +693,11 @@ def richie_fa_gifs(dec_file, fa_file, anat_file, mask_file, prefix):
     Returns: None
 
     """
+
+    anat_img = nb.load(anat_file)
+    anat_data = anat_img.get_fdata()
+    anat_vmin, anat_vmax = scoreatpercentile(anat_data.flatten(), [1, 98])
+
     # Load the RGB data. It was created by tortoise, but resampled into
     # pngres space. This also converts it to a 3-vector data type.
     rgb_img = nb.load(dec_file)
@@ -656,10 +707,6 @@ def richie_fa_gifs(dec_file, fa_file, anat_file, mask_file, prefix):
     # Open FA image and turn it into alpha values
     fa_img = nb.load(fa_file)
     fa_data = fa_to_alpha(np.clip(0, 1, fa_img.get_fdata())) * 255
-
-    anat_img = nb.load(anat_file)
-    anat_data = anat_img.get_fdata()
-    anat_vmin, anat_vmax = scoreatpercentile(anat_data.flatten(), [1, 98])
 
     print(f"Setting grayscale vmax to {anat_vmax}")
 
