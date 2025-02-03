@@ -115,11 +115,11 @@ def create_dwires_png_space(dwi_file, hires_maskfile, hires_anatfile, res="dwi")
         Path to qsiprep-preprocessed dwi file
 
     hires_maskfile: str
-        Path to the brain mask from qsiprep. If res is "anat" it should be a 
+        Path to the brain mask from qsiprep. If res is "anat" it should be a
         cube already
 
     hires_anatfile: str
-        Path to the brain mask from qsiprep. If res is "anat" it should be a 
+        Path to the brain mask from qsiprep. If res is "anat" it should be a
         cube already
 
     res : str
@@ -587,12 +587,15 @@ def create_gifs(bids_dir, subject, output_dir, session=None):
 
     # Use pybids to grab the necessary image files
     initial_bids_filters = {"subject": subject, "return_type": "filename"}
+    if session:
+        initial_bids_filters["session"] = session.replace("ses-", "")
 
     # Prepare the PNG space and get the anatomical data resampled into it
     anat_mask_file = layout.get(
         suffix="mask",
         datatype="anat",
         extension="nii.gz",
+        space="ACPC",
         **initial_bids_filters,
     )
     if not anat_mask_file:
@@ -602,6 +605,7 @@ def create_gifs(bids_dir, subject, output_dir, session=None):
     anat_hires_file = layout.get(
         suffix="T2w",
         datatype="anat",
+        extension=".nii.gz",
         **initial_bids_filters,
     )
     if not anat_hires_file:
@@ -617,12 +621,6 @@ def create_gifs(bids_dir, subject, output_dir, session=None):
         "//", "/"
     )
     os.makedirs(png_dir, exist_ok=True)
-
-    # The anatomical outputs from QSIPrep v<1.0
-    # cannot be in session directories
-    # Add this filter after we've found the anatomical data
-    if session is not None:
-        initial_bids_filters["session"] = session
 
     # get the hires anatomical data into a nice cube
     hirescube_mask_file, hirescube_anat_file = create_hires_png_space(anat_mask_file, anat_hires_file)
